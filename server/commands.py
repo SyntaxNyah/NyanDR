@@ -12585,3 +12585,275 @@ def ooc_cmd_hub_toggle_global(client: ClientManager.Client, arg: str):
     client.hub.allow_global = not client.hub.allow_global
     status = 'enabled' if client.hub.allow_global else 'disabled'
     client.send_ooc(f'You have {status} hub wide global chat.')
+
+# ============================================================
+# Investigation Mode
+# ============================================================
+# Per-area state: { area_id: { 'active': bool, 'clues': [{'id': int, 'name': str, 'desc': str}],
+#                              'found': { ipid: set(clue_id) } } }
+_investigation_state = {}
+
+def ooc_cmd_investigate(client: ClientManager.Client, arg: str):
+    """(STAFF ONLY) Manage an investigation minigame in the current area.
+
+    Usage:
+      /investigate start <clue1_name> : <clue1_desc> [| <clue2_name> : <clue2_desc> ...]
+      /investigate end
+      /investigate hide <clue_name>
+      /investigate clues
+    """
+    Constants.assert_command(client, arg, is_staff=True, parameters='>0')
+    args = arg.split(' ', 1)
+    subcmd = args[0].lower()
+    area_id = client.area.id
+
+    if subcmd == 'start':
+        if len(args) < 2 or not args[1].strip():
+            raise ArgumentError('Usage: /investigate start <name> : <desc> [| ...]')
+        raw_clues = args[1].split('|')
+        clues = []
+        for i, raw in enumerate(raw_clues):
+            if ':' not in raw:
+                raise ArgumentError('Each clue must be in the form: name : description')
+            name_part, desc_part = raw.split(':', 1)
+            clues.append({'id': i, 'name': name_part.strip(), 'desc': desc_part.strip(), 'hidden': False})
+        _investigation_state[area_id] = {'active': True, 'clues': clues, 'found': {}}
+        client.send_ooc('Investigation started with {} clue(s). Players can use /search to find clues.'.format(len(clues)))
+        client.send_ooc_others('An investigation has begun! Use /search to look for clues.',
+                               is_zstaff_flex=False, in_area=True)
+
+    elif subcmd == 'end':
+        if area_id not in _investigation_state:
+            raise ClientError('No investigation is active in this area.')
+        state = _investigation_state.pop(area_id)
+        total = len(state['clues'])
+        client.send_ooc('Investigation ended. {} clue(s) were available.'.format(total))
+        client.send_ooc_others('The investigation has ended.',
+                               is_zstaff_flex=False, in_area=True)
+
+    elif subcmd == 'hide':
+        if area_id not in _investigation_state or not _investigation_state[area_id]['active']:
+            raise ClientError('No investigation is active in this area.')
+        if len(args) < 2 or not args[1].strip():
+            raise ArgumentError('Usage: /investigate hide <clue_name>')
+        target_name = args[1].strip().lower()
+        found = False
+        for clue in _investigation_state[area_id]['clues']:
+            if clue['name'].lower() == target_name:
+                clue['hidden'] = True
+                found = True
+                break
+        if not found:
+            raise ClientError('No clue with that name exists.')
+        client.send_ooc('Clue "{}" is now hidden.'.format(args[1].strip()))
+
+    elif subcmd == 'clues':
+        if area_id not in _investigation_state:
+            raise ClientError('No investigation is active in this area.')
+        clues = _investigation_state[area_id]['clues']
+        lines = ['Clues in this area ({} total):'.format(len(clues))]
+        for c in clues:
+            status = ' [HIDDEN]' if c.get('hidden') else ''
+            lines.append('  [{}] {}{}'.format(c['id'], c['name'], status))
+        client.send_ooc('\n'.join(lines))
+
+    else:
+        raise ArgumentError('Unknown subcommand. Use: start, end, hide, clues')
+
+def ooc_cmd_search(client: ClientManager.Client, arg: str):
+    """Search the current area for investigation clues.
+
+    Usage: /search
+    """
+    Constants.assert_command(client, arg, is_staff=False, parameters='=0')
+    area_id = client.area.id
+    if area_id not in _investigation_state or not _investigation_state[area_id]['active']:
+        raise ClientError('There is no active investigation in this area.')
+
+    state = _investigation_state[area_id]
+    ipid = client.ipid
+    found_set = state['found'].setdefault(ipid, set())
+
+    available = [c for c in state['clues'] if not c.get('hidden') and c['id'] not in found_set]
+    if not available:
+        client.send_ooc('You have already found all available clues in this area.')
+        return
+
+    clue = random.choice(available)
+    found_set.add(clue['id'])
+    client.send_ooc('You found a clue: {}! Use /examine {} for details.'.format(clue['name'], clue['name']))
+    client.send_ooc_others('{} found a clue!'.format(client.displayname),
+                           is_zstaff_flex=False, in_area=True)
+
+def ooc_cmd_clues(client: ClientManager.Client, arg: str):
+    """List all clues you have found in the current area.
+
+    Usage: /clues
+    """
+    Constants.assert_command(client, arg, is_staff=False, parameters='=0')
+    area_id = client.area.id
+    if area_id not in _investigation_state or not _investigation_state[area_id]['active']:
+        raise ClientError('There is no active investigation in this area.')
+
+    state = _investigation_state[area_id]
+    ipid = client.ipid
+    found_set = state['found'].get(ipid, set())
+    if not found_set:
+        client.send_ooc('You have not found any clues yet. Use /search to look around.')
+        return
+
+    found_clues = [c for c in state['clues'] if c['id'] in found_set]
+    lines = ['Your discovered clues ({}/{}):'.format(len(found_clues), len(state['clues']))]
+    for c in found_clues:
+        lines.append('  - {} (use /examine {} for details)'.format(c['name'], c['name']))
+    client.send_ooc('\n'.join(lines))
+
+def ooc_cmd_examine(client: ClientManager.Client, arg: str):
+    """Show the full description of a discovered clue.
+
+    Usage: /examine <clue name>
+    """
+    Constants.assert_command(client, arg, is_staff=False, parameters='>0')
+    area_id = client.area.id
+    if area_id not in _investigation_state or not _investigation_state[area_id]['active']:
+        raise ClientError('There is no active investigation in this area.')
+
+    state = _investigation_state[area_id]
+    ipid = client.ipid
+    found_set = state['found'].get(ipid, set())
+    target = arg.strip().lower()
+
+    for clue in state['clues']:
+        if clue['name'].lower() == target:
+            if clue['id'] not in found_set:
+                raise ClientError('You have not found that clue yet. Use /search to look around.')
+            client.send_ooc('[Clue: {}]\n{}'.format(clue['name'], clue['desc']))
+            return
+
+    raise ClientError('No clue named "{}" exists.'.format(arg.strip()))
+
+# ============================================================
+# Class Trial Voting
+# ============================================================
+# Per-area state: { area_id: { 'suspects': [str], 'votes': {ipid: str},
+#                              'deadline': float, 'open': bool } }
+_CLASSVOTE_DURATION = 60  # seconds
+_classvote_state = {}
+
+def _classvote_results_text(state: dict) -> str:
+    tally = {}
+    for suspect in state['suspects']:
+        tally[suspect] = 0
+    for voted_suspect in state['votes'].values():
+        if voted_suspect in tally:
+            tally[voted_suspect] += 1
+    total = sum(tally.values())
+    lines = ['Class Trial Results ({} vote(s) cast):'.format(total)]
+    for suspect, count in sorted(tally.items(), key=lambda x: -x[1]):
+        bar = '#' * count
+        lines.append('  {}: {} ({})'.format(suspect, bar if bar else '-', count))
+    return '\n'.join(lines)
+
+def ooc_cmd_classvote(client: ClientManager.Client, arg: str):
+    """(STAFF ONLY) Manage a class trial vote.
+
+    Usage:
+      /classvote start <Suspect 1> | <Suspect 2> [| ...]
+      /classvote end
+      /classvote status
+    """
+    Constants.assert_command(client, arg, is_staff=True, parameters='>0')
+    args = arg.split(' ', 1)
+    subcmd = args[0].lower()
+    area_id = client.area.id
+
+    if subcmd == 'start':
+        if len(args) < 2 or not args[1].strip():
+            raise ArgumentError('Usage: /classvote start <Suspect 1> | <Suspect 2> [| ...]')
+        suspects = [s.strip() for s in args[1].split('|') if s.strip()]
+        if len(suspects) < 2:
+            raise ArgumentError('You must provide at least 2 suspects separated by |.')
+        deadline = time.time() + _CLASSVOTE_DURATION
+        _classvote_state[area_id] = {
+            'suspects': suspects,
+            'votes': {},
+            'deadline': deadline,
+            'open': True,
+        }
+        suspect_list = ', '.join(suspects)
+        announcement = (
+            'A CLASS TRIAL VOTE has begun! Suspects: {}\n'
+            'Use /vote <name> to cast your vote. Voting closes in {} seconds.'
+        ).format(suspect_list, _CLASSVOTE_DURATION)
+        client.send_ooc(announcement)
+        client.send_ooc_others(announcement, is_zstaff_flex=False, in_area=True)
+
+    elif subcmd == 'end':
+        if area_id not in _classvote_state:
+            raise ClientError('No class trial vote is active in this area.')
+        state = _classvote_state.pop(area_id)
+        state['open'] = False
+        results = _classvote_results_text(state)
+        client.send_ooc(results)
+        client.send_ooc_others(results, is_zstaff_flex=False, in_area=True)
+
+    elif subcmd == 'status':
+        if area_id not in _classvote_state:
+            raise ClientError('No class trial vote is active in this area.')
+        state = _classvote_state[area_id]
+        remaining = max(0, int(state['deadline'] - time.time()))
+        lines = [_classvote_results_text(state)]
+        if state['open']:
+            lines.append('Time remaining: {}s'.format(remaining))
+        client.send_ooc('\n'.join(lines))
+
+    else:
+        raise ArgumentError('Unknown subcommand. Use: start, end, status')
+
+def ooc_cmd_vote(client: ClientManager.Client, arg: str):
+    """Cast or change your vote in the active class trial.
+
+    Usage: /vote <suspect name>
+    """
+    Constants.assert_command(client, arg, is_staff=False, parameters='>0')
+    area_id = client.area.id
+    if area_id not in _classvote_state:
+        raise ClientError('There is no active class trial vote in this area.')
+
+    state = _classvote_state[area_id]
+
+    # Auto-close if the deadline has passed.
+    if time.time() > state['deadline'] and state['open']:
+        state['open'] = False
+        results = _classvote_results_text(state)
+        del _classvote_state[area_id]
+        client.send_ooc('Voting time has expired!\n' + results)
+        client.send_ooc_others('Voting time has expired!\n' + results,
+                               is_zstaff_flex=False, in_area=True)
+        return
+
+    if not state['open']:
+        raise ClientError('The vote has already closed.')
+
+    target = arg.strip().lower()
+    matched = None
+    for suspect in state['suspects']:
+        if suspect.lower() == target or suspect.lower().startswith(target):
+            matched = suspect
+            break
+    if matched is None:
+        raise ClientError('No suspect matching "{}". Options: {}'.format(
+            arg.strip(), ', '.join(state['suspects'])))
+
+    ipid = client.ipid
+    previous = state['votes'].get(ipid)
+    state['votes'][ipid] = matched
+
+    if previous and previous != matched:
+        client.send_ooc('You changed your vote from {} to {}.'.format(previous, matched))
+        client.send_ooc_others('{} changed their vote.'.format(client.displayname),
+                               is_zstaff_flex=False, in_area=True)
+    else:
+        client.send_ooc('You voted for {}.'.format(matched))
+        client.send_ooc_others('{} has voted.'.format(client.displayname),
+                               is_zstaff_flex=False, in_area=True)
